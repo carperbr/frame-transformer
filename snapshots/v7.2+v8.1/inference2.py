@@ -108,6 +108,140 @@ class Separator(object):
 
         return y_spec, v_spec, m_spec
 
+def parse_arguments(p):
+    p.add_argument('--gpu', '-g', type=int, default=-1)
+    p.add_argument('--pretrained_model_v8', type=str, default='model.v8.1.pth') # https://mega.nz/file/n8IUwJZK#D9-1u7RqYZF4lt_lJ5By58PPj4a0itdojF-fUZf_WQA
+    p.add_argument('--pretrained_model_v7', type=str, default='model.v7.2.pth') # https://mega.nz/file/L55UwZAC#leWuP1ic9Rt4SpDVHeo6tnimaEIw5095ORoiaosF1Do
+    p.add_argument('--input', '-i', required=True)
+    p.add_argument('--output', '-o', type=str, default="")
+    p.add_argument('--output_format', type=str, default="flac")
+    p.add_argument('--num_res_encoders', type=int, default=4)
+    p.add_argument('--num_res_decoders', type=int, default=4)
+    p.add_argument('--sr', '-r', type=int, default=44100)
+    p.add_argument('--n_fft', '-f', type=int, default=2048)
+    p.add_argument('--hop_length', '-H', type=int, default=1024)
+    p.add_argument('--batchsize', '-B', type=int, default=4)
+    p.add_argument('--cropsize', '-c', type=int, default=1024)
+    p.add_argument('--padding', type=int, default=512)
+    p.add_argument('--output_image', '-I', action='store_true')
+    p.add_argument('--copy_source_images', action='store_true') # copies images from input into output
+    p.add_argument('--postprocess', '-p', action='store_true')
+    p.add_argument('--path_from_tags', action='store_true') # names final folder from tags rather than original
+    p.add_argument('--create_webm', action='store_true')
+    p.add_argument('--create_vocals', action='store_true')
+    p.add_argument('--num_encoders', type=int, default=2)
+    p.add_argument('--num_decoders', type=int, default=13)
+    p.add_argument('--tta', '-t', action='store_true')
+    p.add_argument('--cropsizes', type=str, default='128,256,512,1024')
+    p.add_argument('--depth', type=int, default=7)
+    p.add_argument('--num_transformer_blocks', type=int, default=2)
+    p.add_argument('--bias', type=str, default='true')
+    p.add_argument('--num_attention_maps', type=int, default=1)
+    p.add_argument('--channels', type=int, default=8)
+    p.add_argument('--num_bridge_layers', type=int, default=4)
+    p.add_argument('--latent_expansion', type=int, default=4)
+    p.add_argument('--expansion', type=float, default=2.2)
+    p.add_argument('--num_heads', type=int, default=8)
+    p.add_argument('--dropout', type=float, default=0.2)
+    p.add_argument('--weight_decay', type=float, default=1e-2)
+    p.add_argument('--seed', type=int, default=1)
+    p.add_argument('--num_res_blocks', type=int, default=1)
+    p.add_argument('--feedforward_expansion', type=int, default=24)
+    # p.add_argument('--rename_dir', action='store_true')
+
+    return p.parse_args()
+
+def load_models(args):
+    # print('loading model v7...', end=' ')
+    device = torch.device('cpu')
+
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+
+    model_v7 = FrameTransformerV7(in_channels=2, out_channels=2, channels=8, dropout=0, n_fft=2048, num_heads=8, expansion=4, latent_expansion=4, num_attention_maps=2)
+    model_v7.load_state_dict(torch.load(args.pretrained_model_v7))
+    
+    # print('loading model v8...', end=' ')
+
+    model_v8 = FrameTransformerV8(in_channels=2, out_channels=2, channels=8, expansion=2.2, n_fft=2048, dropout=0, num_heads=8, num_attention_maps=1)
+    model_v8.load_state_dict(torch.load(args.pretrained_model_v8))
+
+    if torch.cuda.is_available() and args.gpu >= 0:
+        device = torch.device('cuda:{}'.format(args.gpu))
+        # model_v8.to(device)
+    # print('done')
+
+    return model_v7, model_v8, device
+
+def transform_track(args, file, fullpath):
+    
+    model_v7, model_v8, device = load_models(args)
+
+    output_format = args.output_format
+
+    print('\nloading wave source...', end=' ')
+    X, sr = librosa.load(
+        file, args.sr, False, dtype=np.float32, res_type='kaiser_fast')
+    basename = os.path.splitext(os.path.basename(file))[0]
+    print(basename)
+
+    if X.ndim == 1:
+        X = np.asarray([X, X])
+
+    print('stft of wave source...', end=' ')
+    X_spec = spec_utils.wave_to_spectrogram(X, args.hop_length, args.n_fft)
+    print('done')
+
+    model_v8.to(device)
+    sp = Separator(None, model_v8, device, args.batchsize, args.cropsize, args.n_fft,   args.postprocess)
+
+    if args.tta:
+        y_spec_a, v_spec_a, _ = sp.separate_tta(X_spec)
+    else:
+        y_spec_a, v_spec_a, _ = sp.separate(X_spec, padding=args.padding)
+
+    model_v8.to('cpu')
+    model_v7.to(device)
+
+    sp = Separator(None, model_v7, device, args.batchsize, args.cropsize, args.n_fft,   args.postprocess)
+
+    if args.tta:
+        y_spec_b, v_spec_b, _ = sp.separate_tta(X_spec)
+    else:
+        y_spec_b, v_spec_b, _ = sp.separate(X_spec, padding=args.padding)
+
+    y_mag_a = np.abs(y_spec_a)
+    y_mag_b = np.abs(y_spec_b)
+    v_mag_a = np.abs(v_spec_a)
+    v_mag_b = np.abs(v_spec_b)
+    y_phase = np.angle(y_spec_a)
+    v_phase = np.angle(v_spec_a)
+    y_mag = np.minimum(y_mag_a, y_mag_b)
+    v_mag = np.maximum(v_mag_a, v_mag_b)
+    y_spec = y_mag * np.exp(1.j * y_phase)
+    v_spec = v_mag * np.exp(1.j * v_phase)
+
+    print('\ninverse stft of instruments...', end=' ')
+    wave = spec_utils.spectrogram_to_wave(y_spec, hop_length=args.hop_length)
+    print('done')
+    inst_file = f'{fullpath}/{basename}_Instruments.{output_format}'
+    sf.write(inst_file, wave.T, sr)
+
+    copy_tags(file,inst_file,"instruments")
+
+    # if args.create_webm:
+    #     vid_file = f'{fullpath}/{basename}.mp4'
+    #     os.system(f'ffmpeg -y -framerate 1 -loop 1 -i "{coverfiles[0]}" -i "{inst_file}" -t {librosa.get_duration(wave, sr=args.sr)} "{vid_file}"')
+
+    if args.create_vocals:
+        print('inverse stft of vocals...', end=' ')
+        wave = spec_utils.spectrogram_to_wave(v_spec, hop_length=args.hop_length)
+        print('done')
+        voc_file = f'{fullpath}/{basename}_Vocals.{output_format}'
+        sf.write(voc_file, wave.T, sr)
+
+    copy_tags(file,voc_file,"vocals")
+
 def copy_tags(input, output, suffix):
     #input ~ 'C://input/tagfile.mp3'
     #output ~ 'H://output/tagfile_Instruments.flac'
@@ -156,79 +290,20 @@ def natural_sort(l):
     return sorted(l, key=alphanum_key)
 
 def main():
-    p = argparse.ArgumentParser()
-    p.add_argument('--gpu', '-g', type=int, default=-1)
-    p.add_argument('--pretrained_model_v8', type=str, default='model.v8.1.pth') # https://mega.nz/file/n8IUwJZK#D9-1u7RqYZF4lt_lJ5By58PPj4a0itdojF-fUZf_WQA
-    p.add_argument('--pretrained_model_v7', type=str, default='model.v7.2.pth') # https://mega.nz/file/L55UwZAC#leWuP1ic9Rt4SpDVHeo6tnimaEIw5095ORoiaosF1Do
-    p.add_argument('--input', '-i', required=True)
-    p.add_argument('--output', '-o', type=str, default="")
-    p.add_argument('--output_format', type=str, default="flac")
-    p.add_argument('--num_res_encoders', type=int, default=4)
-    p.add_argument('--num_res_decoders', type=int, default=4)
-    p.add_argument('--sr', '-r', type=int, default=44100)
-    p.add_argument('--n_fft', '-f', type=int, default=2048)
-    p.add_argument('--hop_length', '-H', type=int, default=1024)
-    p.add_argument('--batchsize', '-B', type=int, default=4)
-    p.add_argument('--cropsize', '-c', type=int, default=1024)
-    p.add_argument('--padding', type=int, default=512)
-    p.add_argument('--output_image', '-I', action='store_true')
-    p.add_argument('--copy_source_images', action='store_true') # copies images from input into output
-    p.add_argument('--postprocess', '-p', action='store_true')
-    p.add_argument('--path_from_tags', action='store_true') # names final folder from tags rather than original
-    p.add_argument('--create_webm', action='store_true')
-    p.add_argument('--create_vocals', action='store_true')
-    p.add_argument('--num_encoders', type=int, default=2)
-    p.add_argument('--num_decoders', type=int, default=13)
-    p.add_argument('--tta', '-t', action='store_true')
-    p.add_argument('--cropsizes', type=str, default='128,256,512,1024')
-    p.add_argument('--depth', type=int, default=7)
-    p.add_argument('--num_transformer_blocks', type=int, default=2)
-    p.add_argument('--bias', type=str, default='true')
-    # p.add_argument('--rename_dir', action='store_true')
-    p.add_argument('--num_attention_maps', type=int, default=1)
-    p.add_argument('--channels', type=int, default=8)
-    p.add_argument('--num_bridge_layers', type=int, default=4)
-    p.add_argument('--latent_expansion', type=int, default=4)
-    p.add_argument('--expansion', type=float, default=2.2)
-    p.add_argument('--num_heads', type=int, default=8)
-    p.add_argument('--dropout', type=float, default=0.2)
-    p.add_argument('--weight_decay', type=float, default=1e-2)
-
-    p.add_argument('--seed', type=int, default=1)
-
-    p.add_argument('--num_res_blocks', type=int, default=1)
-    p.add_argument('--feedforward_expansion', type=int, default=24)
-
-    args = p.parse_args()
+    args = parse_arguments(argparse.ArgumentParser())
+    
     args.cropsizes = [int(cropsize) for cropsize in args.cropsizes.split(',')]
     # args.rename_dir = str.lower(args.rename_dir) == 'true'
-
-    print('loading model v7...', end=' ')
-    device = torch.device('cpu')
-
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
-
-    model_v7 = FrameTransformerV7(in_channels=2, out_channels=2, channels=8, dropout=0, n_fft=2048, num_heads=8, expansion=4, latent_expansion=4, num_attention_maps=2)
-    model_v7.load_state_dict(torch.load(args.pretrained_model_v7))
-    
-    print('loading model v8...', end=' ')
-
-    model_v8 = FrameTransformerV8(in_channels=2, out_channels=2, channels=8, expansion=2.2, n_fft=2048, dropout=0, num_heads=8, num_attention_maps=1)
-    model_v8.load_state_dict(torch.load(args.pretrained_model_v8))
-
-    if torch.cuda.is_available() and args.gpu >= 0:
-        device = torch.device('cuda:{}'.format(args.gpu))
-        # model_v8.to(device)
-    print('done')
 
     output_folder = args.output
     if output_folder != '' and not os.path.exists(output_folder):
         os.makedirs(output_folder)
-        
+
     output_format = args.output_format.lower()
     if output_format not in ["flac", "wav", "mp3"]:
         output_format = "flac"
+
+    args.output_format = output_format
 
     if os.path.isdir(args.input):
         args.input = os.path.join(args.input, '')
@@ -264,131 +339,10 @@ def main():
                 shutil.copy(f, fullpath)	
 
         for file in tqdm(files):
-            print('\nloading wave source...', end=' ')
-            X, sr = librosa.load(
-                file, args.sr, False, dtype=np.float32, res_type='kaiser_fast')
-            basename = os.path.splitext(os.path.basename(file))[0]
-            print(basename)
-
-            if X.ndim == 1:
-                X = np.asarray([X, X])
-
-            print('stft of wave source...', end=' ')
-            X_spec = spec_utils.wave_to_spectrogram(X, args.hop_length, args.n_fft)
-            print('done')
-
-            model_v8.to(device)
-            sp = Separator(None, model_v8, device, args.batchsize, args.cropsize, args.n_fft,   args.postprocess)
-
-            if args.tta:
-                y_spec_a, v_spec_a, _ = sp.separate_tta(X_spec)
-            else:
-                y_spec_a, v_spec_a, _ = sp.separate(X_spec, padding=args.padding)
-
-            model_v8.to('cpu')
-            model_v7.to(device)
-
-            sp = Separator(None, model_v7, device, args.batchsize, args.cropsize, args.n_fft,   args.postprocess)
-
-            if args.tta:
-                y_spec_b, v_spec_b, _ = sp.separate_tta(X_spec)
-            else:
-                y_spec_b, v_spec_b, _ = sp.separate(X_spec, padding=args.padding)
-
-            y_mag_a = np.abs(y_spec_a)
-            y_mag_b = np.abs(y_spec_b)
-            v_mag_a = np.abs(v_spec_a)
-            v_mag_b = np.abs(v_spec_b)
-            y_phase = np.angle(y_spec_a)
-            v_phase = np.angle(v_spec_a)
-            y_mag = np.minimum(y_mag_a, y_mag_b)
-            v_mag = np.maximum(v_mag_a, v_mag_b)
-            y_spec = y_mag * np.exp(1.j * y_phase)
-            v_spec = v_mag * np.exp(1.j * v_phase)
-
-            print('\ninverse stft of instruments...', end=' ')
-            wave = spec_utils.spectrogram_to_wave(y_spec, hop_length=args.hop_length)
-            print('done')
-            inst_file = f'{fullpath}/{basename}_Instruments.{output_format}'
-            sf.write(inst_file, wave.T, sr)
-
-            copy_tags(file,inst_file,"instruments")
-
-            if args.create_webm:
-                vid_file = f'{fullpath}/{basename}.mp4'
-                os.system(f'ffmpeg -y -framerate 1 -loop 1 -i "{coverfiles[0]}" -i "{inst_file}" -t {librosa.get_duration(wave, sr=args.sr)} "{vid_file}"')
-
-            if args.create_vocals:
-                print('\ninverse stft of vocals...', end=' ')
-                wave = spec_utils.spectrogram_to_wave(v_spec, hop_length=args.hop_length)
-                print('done')
-                voc_file = f'{fullpath}/{basename}_Vocals.{output_format}'
-                sf.write(voc_file, wave.T, sr)
-
-                copy_tags(file,voc_file,"vocals")
-
-        # if args.rename_dir:
-        #     os.system(f'python song-renamer.py --dir "{fullpath}"')
-            
-    else:
-        print('\nloading wave source...', end=' ')
-        X, sr = librosa.load(
-            args.input, args.sr, False, dtype=np.float32, res_type='kaiser_fast')
-        basename = os.path.splitext(os.path.basename(args.input))[0]
-        print('done')
-
-        if X.ndim == 1:
-            # mono to stereo
-            X = np.asarray([X, X])
-
-        print('stft of wave source...', end=' ')
-        X_spec = spec_utils.wave_to_spectrogram(X, args.hop_length, args.n_fft)
-        print('done')
-
-        model_v8.to(device)
-        sp = Separator(None, model_v8, device, args.batchsize, args.cropsize, args.n_fft,   args.postprocess)
-
-        if args.tta:
-            y_spec_a, v_spec_a, _ = sp.separate_tta(X_spec)
-        else:
-            y_spec_a, v_spec_a, _ = sp.separate(X_spec, padding=args.padding)
-
-        model_v8.to('cpu')
-        model_v7.to(device)
-
-        sp = Separator(None, model_v7, device, args.batchsize, args.cropsize, args.n_fft,   args.postprocess)
-
-        if args.tta:
-            y_spec_b, v_spec_b, _ = sp.separate_tta(X_spec)
-        else:
-            y_spec_b, v_spec_b, _ = sp.separate(X_spec, padding=args.padding)
-
-        y_spec = np.minimum(y_spec_a, y_spec_b)
-        v_spec = np.maximum(v_spec_a, v_spec_b)
-
-        print('\ninverse stft of instruments...', end=' ')
-        wave = spec_utils.spectrogram_to_wave(y_spec_a, hop_length=args.hop_length)
-        print('done')
-        inst_file = f'{output_folder}/{basename}_Instruments.{output_format}'
-        sf.write(inst_file, wave.T, sr)
-
-        copy_tags(file, inst_file, "instruments")
-
-        if args.create_vocals:
-            print('inverse stft of vocals...', end=' ')
-            wave = spec_utils.spectrogram_to_wave(v_spec_a, hop_length=args.hop_length)
-            print('done')
-            voc_file = f'{output_folder}/{basename}_Vocals.{output_format}'
-            sf.write(voc_file, wave.T, sr)
-            
-            copy_tags(file,voc_file,"vocals")
-
-        if args.output_image:
-            image = spec_utils.spectrogram_to_image(y_spec)
-            utils.imwrite('{}_Instruments.jpg'.format(basename), image)
-
-            image = spec_utils.spectrogram_to_image(v_spec)
-            utils.imwrite('{}_Vocals.jpg'.format(basename), image)
-
+            transform_track(args, file, fullpath)
+                        
+    else: # args.input is a single file
+            transform_track(args, args.input, output_folder)
+        
 if __name__ == '__main__':
     main()
