@@ -1,5 +1,7 @@
 # FrameTransformer
 
+Been a while, but there will be some large updates here very soon that may get put into a new repository. I've redesigned the neural network architecture using an dual attention-based cross-layer memory mechanism as well as adjusting how it processes spectrograms which has greatly increased accuracy.
+
 I have updated the project with a new neural network inspired by hierarchical transformers and my older frame transformer
 
 The new architecture is a temporal u-net frame transformer rather than a frequency u-net. This has the added benefit of condensing the sequence length akin to hierarchical transformers which allows for more processing power in the transformer. This appears to capture temporal dynamics quite well as well, and with an updated data synthesis technique it appears the quality has surpassed the frequency u-net despite only being at 280k optimization steps thus far. V9 was a bit of a failed experiment though it did teach me some new stuff, specifically that the data synthesis changes were indeed beneficial and that the patch transformer setup isn't very great at capturing temporal dynamics in audio given that you are breaking apart the true temporal dynamics in that process. V10 will continue training until 2 million optimization steps, so it has quite a bit to go until fully trained which is a very promising sign given that it surpassed v9 when v9 was at 1.5mil optimization steps while it was only at 280k optimization steps.
